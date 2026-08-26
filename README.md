@@ -115,20 +115,25 @@ All knobs are optional; the block can be empty (`badger_gc`) to accept defaults.
 
 ## Verifying it works
 
-At **startup** the module logs whether it actually found a Badger storer — this
-is the check that all the *Requirements* above are met, surfaced at deploy time
-(not one interval later):
+At **startup** the module waits (up to 30s, polling) for Souin's badger storer to
+register, then logs whether it found one and runs a first reclaim immediately —
+this is the check that all the *Requirements* above are met, surfaced at deploy
+time (not one interval later):
 
 ```
 badger_gc started                          {"interval":"10m0s","discard_ratio":0.5,"max_rewrites_per_sweep":0}
 badger_gc: attached to Souin badger storer(s)  {"count":1}      # ✅ requirements met
+badger_gc reclaimed value-log files        {"rewrites":7}       # first sweep, at startup
 ```
 
-If instead you see this, the module is a **no-op** — fix the build/version/backend
-(see *Requirements*) before relying on it:
+(The wait is deliberate: Souin registers its storer while the HTTP app provisions
+its cache handler, which may finish *after* this app starts — so a single probe at
+start would race it. The GC sweep also re-resolves the registry every tick, so a
+reload can never pin it to a closed handle.) If instead you see this, the module
+is a **no-op** — fix the build/version/backend (see *Requirements*):
 
 ```
-badger_gc: no Badger-backed Souin storer found -- this module is a NO-OP. ...
+badger_gc: no Badger-backed Souin storer found within 30s -- this module is a NO-OP. ...
 ```
 
 Each sweep that reclaims space logs its file count, and you can watch the value

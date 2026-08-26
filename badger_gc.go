@@ -98,14 +98,13 @@ func (a *App) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Start launches the background GC goroutine and immediately confirms whether it
-// is actually attached to a Badger storer. Caddy provisions every app (including
-// Souin's HTTP handler, which registers the badger storer) before it starts any
-// app, so by the time Start runs the storer is already in the registry -- letting
-// us surface the SILENT-NO-OP case at deploy time instead of one interval later.
-// A no-op almost always means this module was built against storages/badger
-// versions that differ from the running binary (so the *badger.Badger assertion
-// never matches) or Souin isn't using the badger backend.
+// attachTimeout bounds how long the sweep goroutine waits for Souin's badger
+// storer to appear in the registry before deciding this module is a no-op.
+const attachTimeout = 30 * time.Second
+
+// Start launches the background GC goroutine. The attach confirmation and the
+// first reclaim happen inside the goroutine (see run), so Start never blocks
+// Caddy's startup.
 func (a *App) Start() error {
 	a.done = make(chan struct{})
 	a.stopped = make(chan struct{})
@@ -114,13 +113,6 @@ func (a *App) Start() error {
 		zap.Float64("discard_ratio", a.DiscardRatio),
 		zap.Int("max_rewrites_per_sweep", a.MaxRewritesPerSweep),
 	)
-	if n := a.badgerStorers(); n > 0 {
-		a.logger.Info("badger_gc: attached to Souin badger storer(s)", zap.Int("count", n))
-	} else {
-		a.logger.Warn("badger_gc: no Badger-backed Souin storer found -- this module is a NO-OP. " +
-			"Verify it was compiled with the SAME storages/badger + dgraph-io/badger versions as Souin, " +
-			"and that Souin uses the badger storage backend.")
-	}
 	go a.run()
 	return nil
 }
@@ -134,6 +126,37 @@ func (a *App) badgerStorers() int {
 		}
 	}
 	return n
+}
+
+// awaitStorers polls the registry until a Badger-backed storer appears, then
+// logs the attach confirmation -- or warns (once) that the module is a no-op if
+// none shows up within attachTimeout. Souin registers its storer while the HTTP
+// app provisions its cache handler; whether that finishes before or after this
+// app's Start is not guaranteed (it depends on provision ordering and how long
+// opening the Badger store takes), so we must NOT probe just once at Start. A
+// no-op almost always means this module was built against storages/badger
+// versions that differ from the running binary (so the *badger.Badger assertion
+// never matches) or Souin isn't using the badger backend. Returns true if
+// attached. Interruptible via done.
+func (a *App) awaitStorers() bool {
+	deadline := time.Now().Add(attachTimeout)
+	for {
+		if n := a.badgerStorers(); n > 0 {
+			a.logger.Info("badger_gc: attached to Souin badger storer(s)", zap.Int("count", n))
+			return true
+		}
+		if time.Now().After(deadline) {
+			a.logger.Warn("badger_gc: no Badger-backed Souin storer found within " + attachTimeout.String() +
+				" -- this module is a NO-OP. Verify it was compiled with the SAME storages/badger + " +
+				"dgraph-io/badger versions as Souin, and that Souin uses the badger storage backend.")
+			return false
+		}
+		select {
+		case <-a.done:
+			return false
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // Stop signals the background goroutine to exit AND waits (bounded) for it to
@@ -160,6 +183,12 @@ func (a *App) Stop() error {
 
 func (a *App) run() {
 	defer close(a.stopped)
+	// Wait for Souin's badger storer to register (logs attach/no-op), then
+	// reclaim once immediately so a large backlog starts shrinking at startup
+	// rather than one interval later.
+	if a.awaitStorers() {
+		a.collect()
+	}
 	ticker := time.NewTicker(time.Duration(a.Interval))
 	defer ticker.Stop()
 	for {
