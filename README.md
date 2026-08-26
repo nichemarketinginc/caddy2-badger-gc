@@ -95,29 +95,32 @@ global-options block at the top of the Caddyfile:
 ```caddyfile
 {
     badger_gc {
-        interval       10m    # how often to sweep (default: 10m)
-        discard_ratio  0.5    # rewrite a vlog file only if it can discard at
-                              # least this fraction (0.0–1.0, default: 0.5)
+        interval                10m   # how often to sweep (default: 10m)
+        discard_ratio           0.5   # rewrite a vlog file only if it can discard
+                                      # at least this fraction (0.0–1.0, default: 0.5)
+        max_rewrites_per_sweep  0     # cap files rewritten per sweep (0 = unlimited)
     }
 
     # ... your Souin / cache global config ...
 }
 ```
 
-Both knobs are optional; the block can be empty (`badger_gc`) to accept defaults.
+All knobs are optional; the block can be empty (`badger_gc`) to accept defaults.
 
-| Option          | Type     | Default | Meaning                                                                                              |
-|-----------------|----------|---------|------------------------------------------------------------------------------------------------------|
-| `interval`      | duration | `10m`   | Time between GC sweeps.                                                                               |
-| `discard_ratio` | float    | `0.5`   | Passed to `RunValueLogGC`: a vlog file is rewritten only if ≥ this fraction is reclaimable. `(0,1)`.  |
+| Option                   | Type     | Default | Meaning                                                                                                                                   |
+|--------------------------|----------|---------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| `interval`               | duration | `10m`   | Time between GC sweeps.                                                                                                                    |
+| `discard_ratio`          | float    | `0.5`   | Passed to `RunValueLogGC`: a vlog file is rewritten only if ≥ this fraction is reclaimable. `(0,1)`.                                       |
+| `max_rewrites_per_sweep` | int      | `0`     | Cap on value-log files rewritten per sweep (shared across storers). `0` = unlimited. Use it to spread a large first-run backlog over ticks so a single sweep doesn't do minutes of disk I/O at once. |
 
 ## Verifying it works
 
-At startup (first sweep) the module logs whether it actually found a Badger
-storer — this is the check that all the *Requirements* above are met:
+At **startup** the module logs whether it actually found a Badger storer — this
+is the check that all the *Requirements* above are met, surfaced at deploy time
+(not one interval later):
 
 ```
-badger_gc started                          {"interval":"10m0s","discard_ratio":0.5}
+badger_gc started                          {"interval":"10m0s","discard_ratio":0.5,"max_rewrites_per_sweep":0}
 badger_gc: attached to Souin badger storer(s)  {"count":1}      # ✅ requirements met
 ```
 

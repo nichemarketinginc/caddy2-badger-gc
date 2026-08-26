@@ -62,10 +62,16 @@ type App struct {
 	// Must be in (0.0, 1.0). Default: 0.5.
 	DiscardRatio float64 `json:"discard_ratio,omitempty"`
 
-	logger     *zap.Logger
-	done       chan struct{} // closed by Stop() to signal the sweep goroutine
-	stopped    chan struct{} // closed by run() when it has fully exited
-	firstSweep bool          // startup confirmation is logged once (run() goroutine only)
+	// MaxRewritesPerSweep caps how many value-log files a single sweep will
+	// rewrite (across all Badger storers), spreading a large backlog -- e.g. the
+	// tens of gigabytes reclaimed on the first sweep after deploy -- across
+	// several ticks instead of one long, I/O-heavy sweep. 0 (default) means no
+	// cap: reclaim everything reclaimable each sweep.
+	MaxRewritesPerSweep int `json:"max_rewrites_per_sweep,omitempty"`
+
+	logger  *zap.Logger
+	done    chan struct{} // closed by Stop() to signal the sweep goroutine
+	stopped chan struct{} // closed by run() when it has fully exited
 }
 
 // CaddyModule returns the Caddy module information. badger_gc is a top-level app
@@ -86,20 +92,48 @@ func (a *App) Provision(ctx caddy.Context) error {
 	if a.DiscardRatio <= 0 || a.DiscardRatio >= 1 {
 		a.DiscardRatio = defaultDiscardRatio
 	}
+	if a.MaxRewritesPerSweep < 0 {
+		a.MaxRewritesPerSweep = 0 // treat a negative as "unlimited"
+	}
 	return nil
 }
 
-// Start launches the background GC goroutine.
+// Start launches the background GC goroutine and immediately confirms whether it
+// is actually attached to a Badger storer. Caddy provisions every app (including
+// Souin's HTTP handler, which registers the badger storer) before it starts any
+// app, so by the time Start runs the storer is already in the registry -- letting
+// us surface the SILENT-NO-OP case at deploy time instead of one interval later.
+// A no-op almost always means this module was built against storages/badger
+// versions that differ from the running binary (so the *badger.Badger assertion
+// never matches) or Souin isn't using the badger backend.
 func (a *App) Start() error {
 	a.done = make(chan struct{})
 	a.stopped = make(chan struct{})
-	a.firstSweep = true
-	go a.run()
 	a.logger.Info("badger_gc started",
 		zap.Duration("interval", time.Duration(a.Interval)),
 		zap.Float64("discard_ratio", a.DiscardRatio),
+		zap.Int("max_rewrites_per_sweep", a.MaxRewritesPerSweep),
 	)
+	if n := a.badgerStorers(); n > 0 {
+		a.logger.Info("badger_gc: attached to Souin badger storer(s)", zap.Int("count", n))
+	} else {
+		a.logger.Warn("badger_gc: no Badger-backed Souin storer found -- this module is a NO-OP. " +
+			"Verify it was compiled with the SAME storages/badger + dgraph-io/badger versions as Souin, " +
+			"and that Souin uses the badger storage backend.")
+	}
+	go a.run()
 	return nil
+}
+
+// badgerStorers reports how many registered Souin storers are Badger-backed.
+func (a *App) badgerStorers() int {
+	n := 0
+	for _, s := range core.GetRegisteredStorers() {
+		if b, ok := s.(*badger.Badger); ok && b.DB != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // Stop signals the background goroutine to exit AND waits (bounded) for it to
@@ -138,16 +172,19 @@ func (a *App) run() {
 	}
 }
 
-// collect runs one GC sweep across all registered Badger-backed storers. It
-// re-resolves the registry every sweep so a Souin reload can never leave us on a
-// stale handle. It also surfaces the SILENT-NO-OP case: if no Badger-backed
-// storer is found, this module is doing nothing -- almost always because it was
-// built against storages/badger versions that differ from the running binary (so
-// the type assertion never matches) or because Souin isn't using the badger
-// backend. That failure is otherwise invisible (garbage just keeps growing), so
-// we log it explicitly on the first sweep.
+// collect runs one GC sweep across all registered Badger-backed storers,
+// re-resolving the registry every sweep so a Souin reload can never leave us on a
+// stale handle. A per-sweep rewrite budget (MaxRewritesPerSweep; 0 = unlimited)
+// is shared across all storers so a large backlog is spread over several ticks
+// rather than done in one long sweep.
 func (a *App) collect() {
-	found := 0
+	// budget < 0 means "unlimited"; a non-negative budget is decremented as files
+	// are rewritten and stops the sweep once it hits zero.
+	budget := -1
+	if a.MaxRewritesPerSweep > 0 {
+		budget = a.MaxRewritesPerSweep
+	}
+	total := 0
 	for _, s := range core.GetRegisteredStorers() {
 		select { // bail promptly if Stop() was called mid-sweep
 		case <-a.done:
@@ -158,27 +195,22 @@ func (a *App) collect() {
 		if !ok || b.DB == nil {
 			continue
 		}
-		found++
-		a.collectOne(b)
-	}
-
-	if a.firstSweep {
-		a.firstSweep = false
-		if found == 0 {
-			a.logger.Warn("badger_gc: no Badger-backed Souin storer found -- this module is a NO-OP. " +
-				"Verify it was compiled with the SAME storages/badger + dgraph-io/badger versions as Souin, " +
-				"and that Souin uses the badger storage backend.")
-		} else {
-			a.logger.Info("badger_gc: attached to Souin badger storer(s)", zap.Int("count", found))
+		total += a.collectOne(b, &budget)
+		if budget == 0 {
+			break
 		}
+	}
+	if total > 0 {
+		a.logger.Info("badger_gc reclaimed value-log files", zap.Int("rewrites", total))
 	}
 }
 
 // collectOne reclaims value-log space on a single handle until Badger reports
-// ErrNoRewrite (or any other error), or until Stop() is signalled. It is wrapped
-// in a recover so that racing a Souin reload that closed this handle mid-sweep
-// degrades to a logged warning rather than taking Caddy down.
-func (a *App) collectOne(b *badger.Badger) {
+// ErrNoRewrite (or any other error), Stop() is signalled, or the shared per-sweep
+// budget (*budget, when >= 0) is exhausted. Returns the number of files rewritten.
+// It is wrapped in a recover so that racing a Souin reload that closed this handle
+// mid-sweep degrades to a logged warning rather than taking Caddy down.
+func (a *App) collectOne(b *badger.Badger, budget *int) (rewrites int) {
 	defer func() {
 		if r := recover(); r != nil {
 			a.logger.Warn("badger_gc recovered from panic during sweep",
@@ -186,12 +218,11 @@ func (a *App) collectOne(b *badger.Badger) {
 		}
 	}()
 
-	rewrites := 0
 	// RunValueLogGC rewrites at most one file per call, returning nil on a
-	// successful rewrite and a non-nil error (ErrNoRewrite) once there is
-	// nothing left worth reclaiming. Check `done` each iteration so a reload
-	// interrupts a long first-run sweep (tens of files) promptly.
-	for {
+	// successful rewrite and a non-nil error (ErrNoRewrite) once there is nothing
+	// left worth reclaiming. Check `done` each iteration so a reload interrupts a
+	// long first-run sweep (tens of files) promptly.
+	for *budget != 0 {
 		select {
 		case <-a.done:
 			return
@@ -201,11 +232,11 @@ func (a *App) collectOne(b *badger.Badger) {
 			break
 		}
 		rewrites++
+		if *budget > 0 {
+			*budget--
+		}
 	}
-	if rewrites > 0 {
-		a.logger.Info("badger_gc reclaimed value-log files",
-			zap.Int("rewrites", rewrites))
-	}
+	return
 }
 
 // parseGlobalOption parses the `badger_gc { ... }` global-options stanza in the
@@ -224,8 +255,9 @@ func parseGlobalOption(d *caddyfile.Dispenser, _ any) (any, error) {
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 //
 //	badger_gc {
-//	    interval       10m
-//	    discard_ratio  0.5
+//	    interval                10m
+//	    discard_ratio           0.5
+//	    max_rewrites_per_sweep  0    # 0 = unlimited
 //	}
 func (a *App) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() { // consume the "badger_gc" token
@@ -254,6 +286,19 @@ func (a *App) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("discard_ratio must be in (0.0, 1.0), got %v", r)
 				}
 				a.DiscardRatio = r
+			case "max_rewrites_per_sweep":
+				var s string
+				if !d.Args(&s) {
+					return d.ArgErr()
+				}
+				n, err := strconv.Atoi(s)
+				if err != nil {
+					return d.Errf("invalid max_rewrites_per_sweep %q: %v", s, err)
+				}
+				if n < 0 {
+					return d.Errf("max_rewrites_per_sweep must be >= 0 (0 = unlimited), got %d", n)
+				}
+				a.MaxRewritesPerSweep = n
 			default:
 				return d.Errf("unrecognized badger_gc option %q", d.Val())
 			}
