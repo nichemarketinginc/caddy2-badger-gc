@@ -62,8 +62,10 @@ type App struct {
 	// Must be in (0.0, 1.0). Default: 0.5.
 	DiscardRatio float64 `json:"discard_ratio,omitempty"`
 
-	logger *zap.Logger
-	done   chan struct{}
+	logger     *zap.Logger
+	done       chan struct{} // closed by Stop() to signal the sweep goroutine
+	stopped    chan struct{} // closed by run() when it has fully exited
+	firstSweep bool          // startup confirmation is logged once (run() goroutine only)
 }
 
 // CaddyModule returns the Caddy module information. badger_gc is a top-level app
@@ -90,6 +92,8 @@ func (a *App) Provision(ctx caddy.Context) error {
 // Start launches the background GC goroutine.
 func (a *App) Start() error {
 	a.done = make(chan struct{})
+	a.stopped = make(chan struct{})
+	a.firstSweep = true
 	go a.run()
 	a.logger.Info("badger_gc started",
 		zap.Duration("interval", time.Duration(a.Interval)),
@@ -98,15 +102,30 @@ func (a *App) Start() error {
 	return nil
 }
 
-// Stop signals the background goroutine to exit.
+// Stop signals the background goroutine to exit AND waits (bounded) for it to
+// actually return. Blocking here is deliberate: on a config reload Caddy stops
+// the old app before the new Souin reopens the DB, so if we returned while a
+// sweep were still running we could leave the OLD goroutine calling
+// RunValueLogGC on a handle the new Souin is closing/reopening -- the exact race
+// we otherwise only paper over with recover(). The sweep loop checks `done`
+// between value-log rewrites, so this wait is normally near-instant; the timeout
+// only guards a single in-flight file rewrite that cannot be interrupted.
 func (a *App) Stop() error {
 	if a.done != nil {
 		close(a.done)
+	}
+	if a.stopped != nil {
+		select {
+		case <-a.stopped:
+		case <-time.After(30 * time.Second):
+			a.logger.Warn("badger_gc did not stop within 30s; proceeding anyway")
+		}
 	}
 	return nil
 }
 
 func (a *App) run() {
+	defer close(a.stopped)
 	ticker := time.NewTicker(time.Duration(a.Interval))
 	defer ticker.Stop()
 	for {
@@ -119,21 +138,46 @@ func (a *App) run() {
 	}
 }
 
-// collect runs one GC sweep across all registered Badger-backed storers.
+// collect runs one GC sweep across all registered Badger-backed storers. It
+// re-resolves the registry every sweep so a Souin reload can never leave us on a
+// stale handle. It also surfaces the SILENT-NO-OP case: if no Badger-backed
+// storer is found, this module is doing nothing -- almost always because it was
+// built against storages/badger versions that differ from the running binary (so
+// the type assertion never matches) or because Souin isn't using the badger
+// backend. That failure is otherwise invisible (garbage just keeps growing), so
+// we log it explicitly on the first sweep.
 func (a *App) collect() {
+	found := 0
 	for _, s := range core.GetRegisteredStorers() {
+		select { // bail promptly if Stop() was called mid-sweep
+		case <-a.done:
+			return
+		default:
+		}
 		b, ok := s.(*badger.Badger)
 		if !ok || b.DB == nil {
 			continue
 		}
+		found++
 		a.collectOne(b)
+	}
+
+	if a.firstSweep {
+		a.firstSweep = false
+		if found == 0 {
+			a.logger.Warn("badger_gc: no Badger-backed Souin storer found -- this module is a NO-OP. " +
+				"Verify it was compiled with the SAME storages/badger + dgraph-io/badger versions as Souin, " +
+				"and that Souin uses the badger storage backend.")
+		} else {
+			a.logger.Info("badger_gc: attached to Souin badger storer(s)", zap.Int("count", found))
+		}
 	}
 }
 
 // collectOne reclaims value-log space on a single handle until Badger reports
-// ErrNoRewrite (or any other error). It is wrapped in a recover so that racing a
-// Souin reload that closed this handle mid-sweep degrades to a logged warning
-// rather than taking Caddy down.
+// ErrNoRewrite (or any other error), or until Stop() is signalled. It is wrapped
+// in a recover so that racing a Souin reload that closed this handle mid-sweep
+// degrades to a logged warning rather than taking Caddy down.
 func (a *App) collectOne(b *badger.Badger) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -145,8 +189,17 @@ func (a *App) collectOne(b *badger.Badger) {
 	rewrites := 0
 	// RunValueLogGC rewrites at most one file per call, returning nil on a
 	// successful rewrite and a non-nil error (ErrNoRewrite) once there is
-	// nothing left worth reclaiming.
-	for b.DB.RunValueLogGC(a.DiscardRatio) == nil {
+	// nothing left worth reclaiming. Check `done` each iteration so a reload
+	// interrupts a long first-run sweep (tens of files) promptly.
+	for {
+		select {
+		case <-a.done:
+			return
+		default:
+		}
+		if err := b.DB.RunValueLogGC(a.DiscardRatio); err != nil {
+			break
+		}
 		rewrites++
 	}
 	if rewrites > 0 {
