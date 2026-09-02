@@ -93,6 +93,7 @@ func (App) CaddyModule() caddy.ModuleInfo {
 // Storers hold the live Badger handle(s).
 func (a *App) Provision(ctx caddy.Context) error {
 	a.logger = ctx.Logger()
+	a.logger.Info("badger_gc: Provision called")
 	if a.Interval <= 0 {
 		a.Interval = caddy.Duration(defaultInterval)
 	}
@@ -115,6 +116,11 @@ func (a *App) Provision(ctx caddy.Context) error {
 		a.logger.Warn("badger_gc: the '" + souinAppID + "' app is not a *httpcache.SouinApp -- " +
 			"cache-handler version mismatch; module is a NO-OP")
 	}
+	a.logger.Info("badger_gc: Provision complete",
+		zap.Bool("cache_app_resolved", a.souinApp != nil),
+		zap.Duration("interval", time.Duration(a.Interval)),
+		zap.Float64("discard_ratio", a.DiscardRatio),
+	)
 	return nil
 }
 
@@ -167,17 +173,22 @@ func (a *App) Stop() error {
 
 func (a *App) run() {
 	defer close(a.stopped)
+	a.logger.Info("badger_gc: run goroutine started; awaiting Souin badger storer(s)")
 	// Wait for the cache app's Badger storer(s) to be populated (logs attach or
 	// no-op), then reclaim once immediately so a large backlog starts shrinking
-	// at startup rather than one interval later.
+	// at startup rather than one interval later. Even if the initial wait times
+	// out, we still enter the ticker loop below and re-resolve the storers on
+	// every sweep, so a slow-starting frontend attaches on a later tick.
 	if a.awaitStorers() {
 		a.collect()
 	}
 	ticker := time.NewTicker(time.Duration(a.Interval))
 	defer ticker.Stop()
+	a.logger.Info("badger_gc: entering sweep loop", zap.Duration("interval", time.Duration(a.Interval)))
 	for {
 		select {
 		case <-a.done:
+			a.logger.Info("badger_gc: sweep loop stopping")
 			return
 		case <-ticker.C:
 			a.collect()
@@ -222,21 +233,41 @@ func (a *App) collect() {
 	if a.MaxRewritesPerSweep > 0 {
 		budget = a.MaxRewritesPerSweep
 	}
+	dbs := a.badgerDBs()
 	total := 0
-	for _, db := range a.badgerDBs() {
+	for _, db := range dbs {
 		select { // bail promptly if Stop() was called mid-sweep
 		case <-a.done:
 			return
 		default:
+		}
+		// Force LSM compaction FIRST so Badger's value-log DISCARD stats are
+		// current. RunValueLogGC chooses which vlog files to rewrite from those
+		// stats, and they are only refreshed during compaction -- which a cache
+		// with a tiny key-set but a churning multi-GB value log almost never
+		// triggers on its own, so the stats go stale and GC finds no candidate
+		// files and reclaims nothing (observed: 16k live keys, 20G vlog ~85% dead,
+		// DISCARD file 4 days stale -> the 2026-08 h482 outage). Flatten updates
+		// the stats so the immediately-following RunValueLogGC can reclaim the dead
+		// files. Best-effort: a Flatten error is logged, not fatal, and we still GC.
+		fstart := time.Now()
+		if err := db.Flatten(2); err != nil {
+			a.logger.Warn("badger_gc: Flatten (compaction to refresh discard stats) failed", zap.Error(err))
+		} else {
+			a.logger.Info("badger_gc: Flatten complete", zap.Duration("took", time.Since(fstart)))
 		}
 		total += a.collectOne(db, &budget)
 		if budget == 0 {
 			break
 		}
 	}
-	if total > 0 {
-		a.logger.Info("badger_gc reclaimed value-log files", zap.Int("rewrites", total))
-	}
+	// Log EVERY sweep, unconditionally, so the logs show the module is alive and
+	// whether it is attached: badger_dbs=0 means it still hasn't found Souin's
+	// storer (no-op this tick); rewrites is how many value-log files it reclaimed.
+	a.logger.Info("badger_gc sweep",
+		zap.Int("badger_dbs", len(dbs)),
+		zap.Int("rewrites", total),
+	)
 }
 
 // collectOne reclaims value-log space on one handle until Badger reports
