@@ -35,7 +35,7 @@ import (
 
 	httpcache "github.com/caddyserver/cache-handler"
 	sbadger "github.com/darkweak/storages/badger" // the Souin storer type (*sbadger.Badger)
-	badgerv3 "github.com/dgraph-io/badger/v3"     // the embedded value-log DB (*badgerv3.DB)
+	badgerv4 "github.com/dgraph-io/badger/v4"     // the embedded value-log DB (*badgerv4.DB)
 )
 
 const (
@@ -125,11 +125,11 @@ func (a *App) Provision(ctx caddy.Context) error {
 }
 
 // badgerDBs returns the live *badger.DB handles the cache app currently holds.
-func (a *App) badgerDBs() []*badgerv3.DB {
+func (a *App) badgerDBs() []*badgerv4.DB {
 	if a.souinApp == nil {
 		return nil
 	}
-	var dbs []*badgerv3.DB
+	var dbs []*badgerv4.DB
 	for _, s := range a.souinApp.Storers {
 		if b, ok := s.(*sbadger.Badger); ok && b.DB != nil {
 			dbs = append(dbs, b.DB)
@@ -275,7 +275,7 @@ func (a *App) collect() {
 // budget (*budget, when >= 0) is exhausted. Returns the number of files
 // rewritten. Wrapped in a recover so that racing a Souin reload that closed this
 // handle mid-sweep degrades to a logged warning rather than taking Caddy down.
-func (a *App) collectOne(db *badgerv3.DB, budget *int) (rewrites int) {
+func (a *App) collectOne(db *badgerv4.DB, budget *int) (rewrites int) {
 	defer func() {
 		if r := recover(); r != nil {
 			a.logger.Warn("badger_gc recovered from panic during sweep", zap.Any("panic", r))
